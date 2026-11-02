@@ -9,10 +9,6 @@ import { DefaultQueryExecutor } from './query-executor/default-query-executor.js
 import type { DatabaseIntrospector } from './dialect/database-introspector.js'
 import { freeze, isObject, isUndefined } from './util/object-utils.js'
 import { RuntimeDriver } from './driver/runtime-driver.js'
-import {
-  isAbortedTransactionError,
-  type AbortedTransactionError,
-} from './driver/aborted-transaction-error.js'
 import { SingleConnectionProvider } from './driver/single-connection-provider.js'
 import {
   type Driver,
@@ -69,8 +65,7 @@ Symbol.asyncDispose ??= Symbol('Symbol.asyncDispose')
  * The main Kysely class.
  *
  * You should create one instance of `Kysely` per database using the {@link Kysely}
- * constructor. The dialect manages database connections and may use a shared
- * pool or database instance.
+ * constructor. Each `Kysely` instance maintains its own connection pool.
  *
  * ### Examples
  *
@@ -605,16 +600,7 @@ export class Kysely<DB>
   /**
    * Releases all resources and disconnects from the database.
    *
-   * Call this when you are done using the `Kysely` instance and Kysely is
-   * responsible for closing its connections, pool, or database instance.
-   *
-   * If the pool or database instance is shared with other consumers or its
-   * lifecycle is managed elsewhere, skip this call. Let the application close it
-   * once all consumers, including Kysely, have finished. No separate cleanup of
-   * the `Kysely` instance is needed.
-   *
-   * The driver is initialized lazily. If initialization hasn't started, this
-   * method does nothing.
+   * You need to call this when you are done using the `Kysely` instance.
    */
   async destroy(): Promise<void> {
     await this.#props.driver.destroy()
@@ -901,15 +887,13 @@ export class TransactionBuilder<DB> {
     validateTransactionSettings(settings)
 
     return this.#props.executor.provideConnection(async (connection) => {
-      const transactionState: ControlledTransactionState = {
-        status: 'active',
-      }
+      const state = { isCommitted: false, isRolledBack: false }
 
       const executor = new NotCommittedOrRolledBackAssertingExecutor(
         this.#props.executor.withConnectionProvider(
           new SingleConnectionProvider(connection),
         ),
-        transactionState,
+        state,
       )
 
       const transaction = new Transaction<DB>({ ...kyselyProps, executor })
@@ -922,15 +906,13 @@ export class TransactionBuilder<DB> {
         const result = await callback(transaction)
 
         await this.#props.driver.commitTransaction(connection)
-        transactionState.status = 'committed'
+        state.isCommitted = true
 
         return result
       } catch (error) {
-        if (isAbortedTransactionError(error)) {
-          transactionState.status = 'aborted'
-        } else if (transactionBegun) {
+        if (transactionBegun) {
           await this.#props.driver.rollbackTransaction(connection)
-          transactionState.status = 'rolled back'
+          state.isRolledBack = true
         }
 
         throw error
@@ -985,7 +967,7 @@ export class ControlledTransactionBuilder<DB> {
     return new ControlledTransaction({
       ...props,
       connection,
-      transactionState: { status: 'active' },
+      state: { isCommitted: false, isRolledBack: false },
       executor: this.#props.executor.withConnectionProvider(
         new SingleConnectionProvider(connection.connection),
       ),
@@ -1005,10 +987,10 @@ export class ControlledTransaction<
       ...props,
       executor: new NotCommittedOrRolledBackAssertingExecutor(
         props.executor,
-        props.transactionState,
+        props.state,
       ),
     }
-    const { connection, transactionState, ...transactionProps } = props
+    const { connection, state, ...transactionProps } = props
     super(transactionProps)
 
     this.#props = freeze(props)
@@ -1018,21 +1000,15 @@ export class ControlledTransaction<
   }
 
   get isCommitted(): boolean {
-    return this.#props.transactionState.status === 'committed'
+    return this.#props.state.isCommitted
   }
 
   get isRolledBack(): boolean {
-    return (
-      this.#props.transactionState.status === 'rolled back' ||
-      this.#props.transactionState.status === 'aborted'
-    )
+    return this.#props.state.isRolledBack
   }
 
   /**
    * Commits the transaction.
-   *
-   * If the database rolls back instead of committing, marks the transaction
-   * as rolled back, releases the connection and throws {@link AbortedTransactionError}.
    *
    * Waits for ongoing queries to finish. Streams must be exhausted or closed
    * before awaiting this command. When consuming a stream with `for await`,
@@ -1062,17 +1038,8 @@ export class ControlledTransaction<
   commit(): Command<void> {
     return new Command(async (): Promise<void> => {
       await this.#props.executor.provideConnection(async (connection) => {
-        try {
-          await this.#props.driver.commitTransaction(connection)
-        } catch (error) {
-          if (isAbortedTransactionError(error)) {
-            this.#props.transactionState.status = 'aborted'
-            this.#props.connection.release()
-          }
-
-          throw error
-        }
-        this.#props.transactionState.status = 'committed'
+        await this.#props.driver.commitTransaction(connection)
+        this.#props.state.isCommitted = true
         this.#props.connection.release()
       })
     })
@@ -1080,9 +1047,6 @@ export class ControlledTransaction<
 
   /**
    * Rolls back the transaction.
-   *
-   * If a commit already reported that the database rolled back the transaction,
-   * succeeds without sending another rollback command.
    *
    * The connection is released even if the rollback fails, so the transaction
    * cannot be used afterwards in either case.
@@ -1114,16 +1078,12 @@ export class ControlledTransaction<
    */
   rollback(): Command<void> {
     return new Command(async (): Promise<void> => {
-      if (this.#props.transactionState.status === 'aborted') {
-        return
-      }
-
       await this.#props.executor.provideConnection(async (connection) => {
         // A failed rollback can't be meaningfully retried (e.g. dead connection).
         try {
           await this.#props.driver.rollbackTransaction(connection)
         } finally {
-          this.#props.transactionState.status = 'rolled back'
+          this.#props.state.isRolledBack = true
           this.#props.connection.release()
         }
       })
@@ -1346,13 +1306,14 @@ export class ControlledTransaction<
   }
 }
 
-interface ControlledTransactionState {
-  status: 'active' | 'committed' | 'rolled back' | 'aborted'
+interface ControlledTransctionState {
+  isCommitted: boolean
+  isRolledBack: boolean
 }
 
 interface ControlledTransactionProps extends KyselyProps {
   readonly connection: ControlledConnection
-  readonly transactionState: ControlledTransactionState
+  readonly state: ControlledTransctionState
 }
 
 export class Command<T> {
@@ -1371,13 +1332,13 @@ export class Command<T> {
 }
 
 function assertNotCommittedOrRolledBack(
-  transactionState: ControlledTransactionState,
+  state: ControlledTransctionState,
 ): void {
-  if (transactionState.status === 'committed') {
+  if (state.isCommitted) {
     throw new Error('Transaction is already committed')
   }
 
-  if (transactionState.status !== 'active') {
+  if (state.isRolledBack) {
     throw new Error('Transaction is already rolled back')
   }
 }
@@ -1390,17 +1351,14 @@ function assertNotCommittedOrRolledBack(
  */
 class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
   readonly #executor: QueryExecutor
-  readonly #transactionState: ControlledTransactionState
+  readonly #state: ControlledTransctionState
 
-  constructor(
-    executor: QueryExecutor,
-    transactionState: ControlledTransactionState,
-  ) {
+  constructor(executor: QueryExecutor, state: ControlledTransctionState) {
     this.#executor =
       executor instanceof NotCommittedOrRolledBackAssertingExecutor
         ? executor.#executor
         : executor
-    this.#transactionState = transactionState
+    this.#state = state
   }
 
   get adapter() {
@@ -1426,10 +1384,10 @@ class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
     consumer: (connection: DatabaseConnection) => Promise<T>,
     options?: AbortableOperationOptions,
   ): Promise<T> {
-    assertNotCommittedOrRolledBack(this.#transactionState)
+    assertNotCommittedOrRolledBack(this.#state)
 
     return this.#executor.provideConnection(async (connection) => {
-      assertNotCommittedOrRolledBack(this.#transactionState)
+      assertNotCommittedOrRolledBack(this.#state)
       return await consumer(connection)
     }, options)
   }
@@ -1438,7 +1396,7 @@ class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
     compiledQuery: CompiledQuery<R>,
     options?: AbortableQueryOptions,
   ): Promise<QueryResult<R>> {
-    assertNotCommittedOrRolledBack(this.#transactionState)
+    assertNotCommittedOrRolledBack(this.#state)
     return this.#executor
       .withConnectionProvider(this)
       .executeQuery(compiledQuery, options)
@@ -1449,7 +1407,7 @@ class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
     chunkSize: number,
     options?: AbortableOperationOptions,
   ): AsyncIterableIterator<QueryResult<R>> {
-    assertNotCommittedOrRolledBack(this.#transactionState)
+    assertNotCommittedOrRolledBack(this.#state)
     return this.#executor
       .withConnectionProvider(this)
       .stream(compiledQuery, chunkSize, options)
@@ -1460,35 +1418,35 @@ class NotCommittedOrRolledBackAssertingExecutor implements QueryExecutor {
   ): QueryExecutor {
     return new NotCommittedOrRolledBackAssertingExecutor(
       this.#executor.withConnectionProvider(connectionProvider),
-      this.#transactionState,
+      this.#state,
     )
   }
 
   withPlugin(plugin: KyselyPlugin): QueryExecutor {
     return new NotCommittedOrRolledBackAssertingExecutor(
       this.#executor.withPlugin(plugin),
-      this.#transactionState,
+      this.#state,
     )
   }
 
   withPlugins(plugins: ReadonlyArray<KyselyPlugin>): QueryExecutor {
     return new NotCommittedOrRolledBackAssertingExecutor(
       this.#executor.withPlugins(plugins),
-      this.#transactionState,
+      this.#state,
     )
   }
 
   withPluginAtFront(plugin: KyselyPlugin): QueryExecutor {
     return new NotCommittedOrRolledBackAssertingExecutor(
       this.#executor.withPluginAtFront(plugin),
-      this.#transactionState,
+      this.#state,
     )
   }
 
   withoutPlugins(): QueryExecutor {
     return new NotCommittedOrRolledBackAssertingExecutor(
       this.#executor.withoutPlugins(),
-      this.#transactionState,
+      this.#state,
     )
   }
 }

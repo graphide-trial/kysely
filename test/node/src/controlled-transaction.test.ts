@@ -1,7 +1,5 @@
-import { DatabaseError as PostgresError } from 'pg'
 import * as sinon from 'sinon'
 import { setImmediate } from 'node:timers/promises'
-import { Pool } from 'pg'
 import { Connection, ISOLATION_LEVEL } from 'tedious'
 import {
   CompiledQuery,
@@ -11,17 +9,12 @@ import {
   DummyDriver,
   Kysely,
   PostgresAdapter,
-  PostgresDialect,
   PostgresIntrospector,
   PostgresQueryCompiler,
-  sql,
   TRANSACTION_ACCESS_MODES,
-  AbortedTransactionError,
-  type Transaction,
 } from '../../../dist/index.js'
 import {
   DIALECTS,
-  DIALECT_CONFIGS,
   type Database,
   type TestContext,
   clearDatabase,
@@ -102,86 +95,6 @@ for (const dialect of DIALECTS) {
     after(async () => {
       await destroyTest(ctx)
     })
-
-    if (variant === 'postgres') {
-      it('should reject a commit when a caught statement error aborted the transaction', async () => {
-        const trx = await ctx.db.startTransaction().execute()
-        const derivedTrx = trx.withSchema('public')
-        const savedQuery = derivedTrx.selectFrom('person').selectAll()
-        const savedCommit = derivedTrx.commit()
-        const person = {
-          id: 1000000,
-          first_name: 'Foo',
-          gender: 'male',
-        } as const
-
-        try {
-          await trx.insertInto('person').values(person).execute()
-          await expect(
-            trx.insertInto('person').values(person).execute(),
-          ).to.be.rejectedWith(PostgresError, 'duplicate key')
-
-          await expect(trx.commit().execute()).to.be.rejectedWith(
-            AbortedTransactionError,
-          )
-          expect(trx.isCommitted).to.be.false
-          expect(trx.isRolledBack).to.be.true
-          expect(derivedTrx.isCommitted).to.be.false
-          expect(derivedTrx.isRolledBack).to.be.true
-          await expect(savedQuery.execute()).to.be.rejectedWith(
-            'Transaction is already rolled back',
-          )
-          await expect(savedCommit.execute()).to.be.rejectedWith(
-            'Transaction is already rolled back',
-          )
-          await trx.rollback().execute()
-        } finally {
-          if (!trx.isCommitted && !trx.isRolledBack) {
-            await trx.rollback().execute()
-          }
-        }
-
-        expect(
-          await ctx.db
-            .selectFrom('person')
-            .selectAll()
-            .where('id', '=', person.id)
-            .execute(),
-        ).to.eql([])
-      })
-
-      it('should commit after recovering from a statement error using a savepoint', async () => {
-        const trx = await ctx.db.startTransaction().execute()
-        const person = {
-          id: 1000000,
-          first_name: 'Foo',
-          gender: 'male',
-        } as const
-
-        try {
-          await trx.insertInto('person').values(person).execute()
-          const savedTrx = await trx.savepoint('before_error').execute()
-          await expect(
-            savedTrx.insertInto('person').values(person).execute(),
-          ).to.be.rejectedWith(PostgresError, 'duplicate key')
-          await savedTrx.rollbackToSavepoint('before_error').execute()
-          await trx.commit().execute()
-          expect(trx.isCommitted).to.be.true
-        } finally {
-          if (!trx.isCommitted) {
-            await trx.rollback().execute()
-          }
-        }
-
-        expect(
-          await ctx.db
-            .selectFrom('person')
-            .select('first_name')
-            .where('id', '=', person.id)
-            .executeTakeFirstOrThrow(),
-        ).to.eql({ first_name: 'Foo' })
-      })
-    }
 
     it('should be able to start and commit a transaction', async () => {
       const trx = await ctx.db.startTransaction().execute()
@@ -373,37 +286,6 @@ for (const dialect of DIALECTS) {
 
       expect(person).to.be.undefined
     })
-
-    if (variant === 'postgres') {
-      it('should discard the client when rollback times out', async () => {
-        const db = new Kysely<Database>({
-          dialect: new PostgresDialect({
-            pool: new Pool({
-              ...DIALECT_CONFIGS.postgres,
-              max: 1,
-              query_timeout: 1_000,
-            }),
-          }),
-        })
-
-        try {
-          const trx = await db.startTransaction().execute()
-          await expect(sql`select pg_sleep(2.5)`.execute(trx)).to.be.rejected
-          await expect(trx.rollback().execute()).to.be.rejected
-          await insertSomething(db)
-          await sql`rollback`.execute(db)
-
-          const person = await ctx.db
-            .selectFrom('person')
-            .select('first_name')
-            .where('first_name', '=', 'Foo')
-            .executeTakeFirst()
-          expect(person).to.eql({ first_name: 'Foo' })
-        } finally {
-          await db.destroy()
-        }
-      })
-    }
 
     if (
       (sqlSpec === 'postgres' && variant !== 'pglite') ||
@@ -1012,65 +894,6 @@ describe('controlled transaction', () => {
     expect(releaseSpy.firstCall.args[0]).to.equal(connection)
   })
 
-  for (const otherCopy of [false, true]) {
-    it(`should block queued queries and release once when commit reports a rollback${otherCopy ? ' from another package copy' : ''}`, async () => {
-      const trx = await db.startTransaction().execute()
-      const derivedTrx = trx.withSchema('public')
-      const savedRollback = derivedTrx.rollback()
-      const finished = new Deferred<void>()
-      const rollbackError = otherCopy
-        ? await createRollbackErrorFromOtherCopy()
-        : new AbortedTransactionError()
-      sandbox.stub(driver, 'commitTransaction').returns(finished.promise)
-      const rollbackSpy = sandbox.spy(driver, 'rollbackTransaction')
-      const releaseSpy = sandbox.spy(driver, 'releaseConnection')
-      const querySpy = sandbox.spy(connection, 'executeQuery')
-      const completion = expect(
-        derivedTrx.commit().execute(),
-      ).to.be.rejectedWith(rollbackError)
-      const query = expect(
-        trx.selectFrom('person').selectAll().execute(),
-      ).to.be.rejectedWith('Transaction is already rolled back')
-
-      finished.reject(rollbackError)
-      await completion
-      await query
-
-      await savedRollback.execute()
-      await trx.rollback().execute()
-      await derivedTrx.rollback().execute()
-
-      expect(trx.isCommitted).to.be.false
-      expect(trx.isRolledBack).to.be.true
-      expect(derivedTrx.isRolledBack).to.be.true
-      expect(querySpy.notCalled).to.be.true
-      expect(rollbackSpy.notCalled).to.be.true
-      expect(releaseSpy.calledOnce).to.be.true
-    })
-  }
-
-  it('should recognize a rollback from another package copy in a managed transaction', async () => {
-    const rollbackError = await createRollbackErrorFromOtherCopy()
-    sandbox.stub(driver, 'commitTransaction').rejects(rollbackError)
-    const rollbackSpy = sandbox.spy(driver, 'rollbackTransaction')
-    const releaseSpy = sandbox.spy(driver, 'releaseConnection')
-    const querySpy = sandbox.spy(connection, 'executeQuery')
-    let escapedTrx: Transaction<Database> | undefined
-
-    await expect(
-      db.transaction().execute(async (trx) => {
-        escapedTrx = trx
-      }),
-    ).to.be.rejectedWith(rollbackError)
-
-    await expect(
-      escapedTrx!.selectFrom('person').selectAll().execute(),
-    ).to.be.rejectedWith('Transaction is already rolled back')
-    expect(querySpy.notCalled).to.be.true
-    expect(rollbackSpy.notCalled).to.be.true
-    expect(releaseSpy.calledOnce).to.be.true
-  })
-
   it('should allow retrying a failed commit', async () => {
     const commandError = new Error('commit failed')
     const commandStub = sandbox.stub(driver, 'commitTransaction')
@@ -1468,19 +1291,4 @@ async function insertSomethingElse(db: Kysely<Database>) {
       gender: 'female',
     })
     .executeTakeFirstOrThrow()
-}
-
-async function createRollbackErrorFromOtherCopy(): Promise<Error> {
-  const otherCopy: typeof import('../../../dist/driver/aborted-transaction-error.js') =
-    await import(
-      new URL(
-        '../../../dist/driver/aborted-transaction-error.js?other-copy',
-        import.meta.url,
-      ).href
-    )
-
-  expect(otherCopy.AbortedTransactionError).to.not.equal(
-    AbortedTransactionError,
-  )
-  return new otherCopy.AbortedTransactionError()
 }

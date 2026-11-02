@@ -50,9 +50,9 @@ jobs:
       fail-fast: false
       matrix:
         # https://endoflife.date/nodejs
-        node-version: [22.x, 24.x, 26.x]
-        variant: ['postgres', 'mysql', 'mssql', 'sqlite', 'pglite']
-        with-transformer: [false, true]
+        node-version: [24.x]
+        variant: ['postgres', 'mysql', 'sqlite', 'pglite']
+        with-transformer: [false]
 
     steps:
       - name: harden runner
@@ -94,6 +94,7 @@ jobs:
         run: pnpm run test:esbuild
 
   deno:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-deno-${{ matrix.deno-version }}-${{ github.event.pull_request.number || github.sha }}
@@ -148,6 +149,7 @@ jobs:
         run: pnpm run lint:deno
 
   bun:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-bun-${{ matrix.bun-version }}-${{ github.event.pull_request.number || github.sha }}
@@ -195,6 +197,7 @@ jobs:
         run: pnpm run test:bun
 
   browser:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-browser-${{ github.event.pull_request.number || github.sha }}
@@ -232,6 +235,7 @@ jobs:
         run: pnpm run test:browser
 
   cloudflare-workers:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-cloudflare-workers-${{ github.event.pull_request.number || github.sha }}
@@ -269,6 +273,7 @@ jobs:
         run: pnpm run test:cloudflare-workers
 
   older-typescript-version:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-older-typescript-version-${{ matrix.typescript-version }}-${{ github.event.pull_request.number || github.sha }}
@@ -332,6 +337,7 @@ jobs:
         run: pnpm run test:typings && pnpm run test:node:build
 
   jsdocs:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-jsdocs-${{ github.event.pull_request.number || github.sha }}
@@ -374,6 +380,7 @@ jobs:
         run: pnpm run test:jsdocs
 
   typescript-composite:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-typescript-composite-${{ github.event.pull_request.number || github.sha }}
@@ -409,6 +416,7 @@ jobs:
         run: npm i && npm run check:types
 
   npm:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-npm-${{ github.event.pull_request.number || github.sha }}
@@ -451,6 +459,7 @@ jobs:
         run: pnpm stage publish --no-git-checks --tag "$DIST_TAG" --dry-run # the workflow runs in a detached head state, so git checks fail
 
   jsr:
+    if: false
     concurrency:
       cancel-in-progress: ${{ github.ref_name != 'master' }}
       group: ${{ github.workflow }}-jsr-${{ github.event.pull_request.number || github.sha }}

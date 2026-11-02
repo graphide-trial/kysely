@@ -60,13 +60,6 @@ export const brandLogos: Record<string, BrandLogo> = {
     viewBox: '0 0 101 22',
     id: 'cal-com',
   },
-  // Monochrome trace of CraigChat/craig apps/dashboard/src/assets/craig.png.
-  // Dark facial outlines and microphone inherit currentColor; other areas are cutouts.
-  Craig: {
-    label: 'Craig',
-    viewBox: '0 0 723 723',
-    id: 'craig',
-  },
   Cypress: {
     label: 'Cypress',
     viewBox: '0 0 119 48',
@@ -288,14 +281,6 @@ export const brandLogos: Record<string, BrandLogo> = {
     label: 'Teable',
     viewBox: '0 0 24 24',
     id: 'teable',
-  },
-  // Official lockup: liketrek/TREK client/public/logo-light.svg; its white
-  // fills inherit currentColor and the icon's clip+rect flattens to a
-  // direct path (the clip path already carried the four-facet shape).
-  TREK: {
-    label: 'TREK',
-    viewBox: '0 0 158 60',
-    id: 'trek',
   },
   // Official wordmark: truefoundry/trueforge docs/logo/light.svg
   TrueForge: {

@@ -4,7 +4,6 @@ import type {
   QueryResult,
 } from '../../driver/database-connection.js'
 import type { Driver, TransactionSettings } from '../../driver/driver.js'
-import { AbortedTransactionError } from '../../driver/aborted-transaction-error.js'
 import { parseSavepointCommand } from '../../parser/savepoint-parser.js'
 import { CompiledQuery } from '../../query-compiler/compiled-query.js'
 import type { QueryCompiler } from '../../query-compiler/query-compiler.js'
@@ -21,7 +20,6 @@ import type {
 } from './postgres-dialect-config.js'
 
 const PRIVATE_RELEASE_METHOD: unique symbol = Symbol()
-const PRIVATE_MARK_FOR_DISCARD_METHOD: unique symbol = Symbol()
 
 export class PostgresDriver implements Driver {
   readonly #config: PostgresDialectConfig
@@ -42,12 +40,6 @@ export class PostgresDriver implements Driver {
     options?: AbortableOperationOptions,
   ): Promise<DatabaseConnection> {
     const client = await this.#pool!.connect()
-
-    // `destroy` was called while the connection was being acquired.
-    if (!this.#pool) {
-      client.release()
-      throw new Error('driver has already been destroyed')
-    }
 
     let connection = this.#connections.get(client)
 
@@ -96,24 +88,11 @@ export class PostgresDriver implements Driver {
   }
 
   async commitTransaction(connection: DatabaseConnection): Promise<void> {
-    const { rows } = await connection.executeQuery<{ command: string }>(
-      CompiledQuery.raw('commit'),
-    )
-
-    // PostgreSQL completes COMMIT with a ROLLBACK tag if an earlier
-    // statement error left the transaction aborted.
-    if (rows[0]?.command === 'ROLLBACK') {
-      throw new AbortedTransactionError()
-    }
+    await connection.executeQuery(CompiledQuery.raw('commit'))
   }
 
-  async rollbackTransaction(connection: PostgresConnection): Promise<void> {
-    try {
-      await connection.executeQuery(CompiledQuery.raw('rollback'))
-    } catch (err) {
-      connection[PRIVATE_MARK_FOR_DISCARD_METHOD]()
-      throw err
-    }
+  async rollbackTransaction(connection: DatabaseConnection): Promise<void> {
+    await connection.executeQuery(CompiledQuery.raw('rollback'))
   }
 
   async savepoint(
@@ -179,7 +158,6 @@ class PostgresConnection implements DatabaseConnection {
   readonly #options: PostgresConnectionOptions
   #queryId?: QueryId
   #pid?: number
-  #discarded?: boolean
 
   constructor(client: PostgresPoolClient, options: PostgresConnectionOptions) {
     this.#client = client
@@ -208,8 +186,6 @@ class PostgresConnection implements DatabaseConnection {
     if (processID) {
       this.#pid = processID
     } else {
-      this.#assertNotDiscarded()
-
       const {
         rows: [{ pid }],
       } = await this.#client.query<{ pid: string }>(
@@ -222,8 +198,6 @@ class PostgresConnection implements DatabaseConnection {
   }
 
   async executeQuery<O>(compiledQuery: CompiledQuery): Promise<QueryResult<O>> {
-    this.#assertNotDiscarded()
-
     try {
       // this helps ensure we don't cancel the wrong query when aborted.
       this.#queryId = compiledQuery.queryId
@@ -234,10 +208,6 @@ class PostgresConnection implements DatabaseConnection {
       )
 
       const { command, rowCount, rows } = result
-
-      if (command === 'ROLLBACK' || command === 'COMMIT') {
-        return { rows: [{ command } as O] }
-      }
 
       return {
         numAffectedRows:
@@ -276,8 +246,6 @@ class PostgresConnection implements DatabaseConnection {
       )
     }
 
-    this.#assertNotDiscarded()
-
     // this helps ensure we don't cancel the wrong query when aborted.
     this.#queryId = compiledQuery.queryId
 
@@ -308,17 +276,7 @@ class PostgresConnection implements DatabaseConnection {
   }
 
   [PRIVATE_RELEASE_METHOD](): void {
-    this.#client.release(Boolean(this.#discarded))
-  }
-
-  [PRIVATE_MARK_FOR_DISCARD_METHOD](): void {
-    this.#discarded = true
-  }
-
-  #assertNotDiscarded(): void {
-    if (this.#discarded) {
-      throw new Error('Postgres connection has been discarded')
-    }
+    this.#client.release()
   }
 
   async #executeControlQuery(

@@ -39,14 +39,8 @@
     -14.8px 50.6px 59.3px -2.5px hsl(var(--shadow-color) / 0.1);
 }
 
-/* Let wide tables and code scroll within the article instead of pushing the
-   table of contents onto another row. */
+/* remove default theme max-width in examples content */
 :root [class^='col docItemCol_'] {
-  min-width: 0;
-}
-
-/* Example pages intentionally use the full available content width. */
-:root [data-pagefind-weight='3'] [class^='col docItemCol_'] {
   max-width: unset !important;
 }
 
